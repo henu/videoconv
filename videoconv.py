@@ -19,24 +19,32 @@ async def main():
     parser = argparse.ArgumentParser(
         description='Convert one or more files into a single video.',
     )
-    parser.add_argument('input_file', type=str, nargs='+', help='One or more input files')
-    parser.add_argument('output_file', type=str, nargs=1, help='Output file')
+    parser.add_argument('input_file', type=str, nargs='*', help='One or more input files')
+    parser.add_argument('output_file', type=str, nargs=1, help='Output file, or input and output file, if they are the same file.')
     args = parser.parse_args()
     input_paths = args.input_file
     output_path = args.output_file[0]
-
-    # If output file already exists, then raise an error
-    if os.path.exists(output_path):
-        raise RuntimeError('Output file already exists!')
 
     # If input files do not exist, then raise an error
     for input_path in input_paths:
         if not os.path.exists(input_path):
             raise RuntimeError(f'Input file {input_path} does not exist!')
 
+    # If output file already exists, then raise an error
+    if input_paths and os.path.exists(output_path):
+        raise RuntimeError('Output file already exists!')
+
     # If there is only one file, then just convert it
     if len(input_paths) == 1:
         await convert_video(input_paths[0], output_path)
+
+    # If there is no input files, then convert the existing file and use the same name as output
+    elif not input_paths:
+        if not os.path.exists(output_path):
+            raise RuntimeError(f'Input file {output_path} does not exist!')
+        temp_file_path = get_temp_filename(filename_prefix=output_path, temp_dir='')
+        await convert_video(output_path, temp_file_path)
+        os.replace(temp_file_path, output_path)
 
     # If there are multiple files
     else:
@@ -68,8 +76,11 @@ def is_problematic(path):
     return magic.from_file(path) in PROBLEMATIC_FILES
 
 
-def get_temp_filename():
-    filename = 'tmp' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + '.mp4'
+def get_temp_filename(filename_prefix='tmp', temp_dir=None):
+    # TODO: Make sure file does not exist!
+    filename = filename_prefix + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + '.mp4'
+    if temp_dir is not None:
+        return os.path.join(temp_dir, filename)
     return os.path.join(tempfile.gettempdir(), filename)
 
 
