@@ -110,6 +110,7 @@ async def convert_video(input_path, output_path):
         '-b:a', '128k',
         '-movflags',
         'faststart',
+        '-map_metadata', '-1',
         output_path,
     )
 
@@ -137,6 +138,7 @@ async def merge_videos(input_paths, output_path):
             '-b:a', '128k',
             '-movflags',
             'faststart',
+            '-map_metadata', '-1',
             output_path,
         )
 
