@@ -73,7 +73,9 @@ async def main():
 
 
 def is_problematic(path):
-    return magic.from_file(path) in PROBLEMATIC_FILES
+    #return magic.from_file(path) in PROBLEMATIC_FILES
+    # For now, consider all formats problematic
+    return True
 
 
 def get_temp_filename(filename_prefix='tmp', temp_dir=None):
