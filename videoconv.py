@@ -4,6 +4,7 @@ import asyncio
 import magic
 import os
 import random
+import shutil
 import string
 import sys
 import tempfile
@@ -45,11 +46,17 @@ async def main():
 
     # If there is no input files, then convert the existing file and use the same name as output
     elif not input_paths:
-        if not os.path.exists(output_path):
-            raise RuntimeError(f'Input file {output_path} does not exist!')
-        temp_file_path = get_temp_filename(filename_prefix=output_path, temp_dir='')
-        await convert_video(output_path, temp_file_path, max_size=max_size)
-        os.replace(temp_file_path, output_path)
+        # If the files have same suffix, then temporary file is needed
+        output_path_base, output_path_ext = os.path.splitext(output_path)
+        if output_path_ext == '.mp4':
+            if not os.path.exists(output_path):
+                raise RuntimeError(f'Input file {output_path} does not exist!')
+            temp_file_path = get_temp_filename(filename_prefix=output_path, temp_dir='')
+            await convert_video(output_path, temp_file_path, max_size=max_size)
+            os.replace(temp_file_path, output_path)
+        else:
+            await convert_video(output_path, f'{output_path_base}.mp4', max_size=max_size)
+            os.remove(output_path)
 
     # If there are multiple files
     else:
@@ -83,9 +90,13 @@ def is_problematic(path):
     return True
 
 
+def get_random_string():
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+
+
 def get_temp_filename(filename_prefix='tmp', temp_dir=None):
     # TODO: Make sure file does not exist!
-    filename = filename_prefix + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + '.mp4'
+    filename = filename_prefix + get_random_string() + '.mp4'
     if temp_dir is not None:
         return os.path.join(temp_dir, filename)
     return os.path.join(tempfile.gettempdir(), filename)
@@ -183,14 +194,22 @@ class ByterateDecider:
 
 async def convert_video(input_path, output_path, max_size=None):
 
+    # FFMpeg doesn't like certain filenames, so use another names if needed
+    fixed_input_path = fix_path_for_ffmpeg(input_path, False)
+    fixed_output_path = fix_path_for_ffmpeg(output_path, True)
+
     byterate_decider = ByterateDecider(max_size=max_size)
 
-    while byterate_decider.check_output_file(output_path):
+    # If input file has problematic name, then make a copy of it
+    if fixed_input_path != input_path:
+        shutil.copyfile(input_path, fixed_input_path)
+
+    while byterate_decider.check_output_file(fixed_output_path):
 
         await run_command(
             'ffmpeg',
             '-loglevel', 'quiet',
-            '-i', input_path,
+            '-i', fixed_input_path,
             '-c:v', 'libx264',
             '-crf', str(byterate_decider.get_crf()),
             '-profile:v',
@@ -203,23 +222,40 @@ async def convert_video(input_path, output_path, max_size=None):
             '-movflags',
             'faststart',
             '-map_metadata', '-1',
-            output_path,
+            fixed_output_path,
         )
+
+    # If input file was copied, then remove it
+    if fixed_input_path != input_path:
+        os.remove(fixed_input_path)
+
+    # If output file has fixed name, then rename it
+    if fixed_output_path != output_path:
+        shutil.move(fixed_output_path, output_path)
 
 
 async def merge_videos(input_paths, output_path, max_size=None):
 
+    # FFMpeg doesn't like certain filenames, so use another names if needed
+    fixed_input_paths = [fix_path_for_ffmpeg(input_path, False) for input_path in input_paths]
+    fixed_output_path = fix_path_for_ffmpeg(output_path, True)
+
+    # If input files have problematic names, then make a copies of them
+    for fixed_input_path, input_path in zip(fixed_output_path, fixed_input_path):
+        if fixed_input_path != input_path:
+            shutil.copyfile(input_path, fixed_input_path)
+
     byterate_decider = ByterateDecider(max_size=max_size)
 
-    while byterate_decider.check_output_file(output_path):
+    while byterate_decider.check_output_file(fixed_output_path):
 
         with tempfile.TemporaryDirectory() as tmp_path:
             # Construct videolist
             videolist_path = os.path.join(tmp_path, 'videolist')
             with open(videolist_path, 'w') as videolist_file:
-                for input_path in input_paths:
-                    input_path_abs = os.path.abspath(input_path)
-                    videolist_file.write(f'file \'{input_path_abs}\'\n')
+                for fixed_input_path in fixed_input_paths:
+                    fixed_input_path_abs = os.path.abspath(fixed_input_path)
+                    videolist_file.write(f'file \'{fixed_input_path_abs}\'\n')
             await run_command(
                 'ffmpeg',
                 '-loglevel', 'quiet',
@@ -236,14 +272,45 @@ async def merge_videos(input_paths, output_path, max_size=None):
                 '-movflags',
                 'faststart',
                 '-map_metadata', '-1',
-                output_path,
+                fixed_output_path,
             )
+
+    # If input files were copied, then remove them
+    for fixed_input_path, input_path in zip(fixed_output_path, fixed_input_path):
+        if fixed_input_path != input_path:
+            os.remove(fixed_input_path)
+
+    # If output file has fixed name, then rename it
+    if fixed_output_path != output_path:
+        shutil.move(fixed_output_path, output_path)
 
 
 async def convert_to_temporary_video(path):
     temp_path = get_temp_filename()
     await convert_video(path, temp_path)
     return temp_path
+
+
+def fix_path_for_ffmpeg(path, prefer_same_filesystem):
+    # If path looks safe
+    if ':' not in path:
+        return path
+
+    parent, filename = os.path.split(path)
+    name, ext = os.path.splitext(filename)
+
+    # Check if we can use the same filesystem
+    if prefer_same_filesystem:
+        use_same_filesystem = ':' not in parent
+    else:
+        use_same_filesystem = False
+
+    if use_same_filesystem:
+        name = name.replace(':', '_')
+        name += '_' + get_random_string()
+        return os.path.join(parent, name + ext)
+
+    return tempfile.mktemp(suffix=ext)
 
 
 if __name__ == '__main__':
