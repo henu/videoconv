@@ -48,10 +48,10 @@ async def main():
     elif not input_paths:
         # If the files have same suffix, then temporary file is needed
         output_path_base, output_path_ext = os.path.splitext(output_path)
-        if output_path_ext == '.mp4':
+        if output_path_ext.lower() in ['.mp4', '.mkv']:
             if not os.path.exists(output_path):
                 raise RuntimeError(f'Input file {output_path} does not exist!')
-            temp_file_path = get_temp_filename(filename_prefix=output_path, temp_dir='')
+            temp_file_path = get_temp_filename(filename_prefix=output_path, ext=output_path_ext, temp_dir='')
             await convert_video(output_path, temp_file_path, max_size=max_size)
             os.replace(temp_file_path, output_path)
         else:
@@ -94,9 +94,9 @@ def get_random_string():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
 
 
-def get_temp_filename(filename_prefix='tmp', temp_dir=None):
+def get_temp_filename(filename_prefix='tmp', ext='.mp4', temp_dir=None):
     # TODO: Make sure file does not exist!
-    filename = filename_prefix + get_random_string() + '.mp4'
+    filename = filename_prefix + get_random_string() + ext
     if temp_dir is not None:
         return os.path.join(temp_dir, filename)
     return os.path.join(tempfile.gettempdir(), filename)
@@ -106,10 +106,28 @@ async def run_command(*args):
     command = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.PIPE,
     )
-    await command.communicate()
+    _, stderr = await command.communicate()
+
+    # If the command failed, then stop and tell what it complained about
+    if command.returncode != 0:
+        message = f'Command "{args[0]}" failed with exit code {command.returncode}'
+        error_output = stderr.decode(errors='replace').strip()
+        if error_output:
+            message += f':\n{error_output}'
+        raise RuntimeError(message)
+
+
+async def run_ffmpeg(output_path, *args):
+    try:
+        await run_command('ffmpeg', *args)
+    except (RuntimeError, asyncio.CancelledError):
+        # Do not leave a broken output file behind
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
 
 
 class ByterateDecider:
@@ -206,24 +224,56 @@ async def convert_video(input_path, output_path, max_size=None):
 
     while byterate_decider.check_output_file(fixed_output_path):
 
-        await run_command(
-            'ffmpeg',
-            '-loglevel', 'quiet',
-            '-i', fixed_input_path,
-            '-c:v', 'libx264',
-            '-crf', str(byterate_decider.get_crf()),
-            '-profile:v',
-            'baseline',
-            '-level', '3.0',
-            '-pix_fmt', 'yuv420p',
-            '-c:a', 'aac',
-            '-ac', '2',
-            '-b:a', '128k',
-            '-movflags',
-            'faststart',
-            '-map_metadata', '-1',
-            fixed_output_path,
-        )
+        if output_path.lower().endswith('.mkv'):
+            await run_ffmpeg(
+                fixed_output_path,
+                # Print only errors
+                '-loglevel', 'error',
+                # Input file
+                '-i', fixed_input_path,
+                # Include all streams
+                '-map', '0',
+                # Video encoding
+                '-c:v', 'libx264',
+                '-crf', str(byterate_decider.get_crf()),
+                '-profile:v', 'baseline',
+                '-level', '3.0',
+                '-pix_fmt', 'yuv420p',
+                # Audio encoding
+                '-c:a', 'aac',
+                '-ac', '2',
+                '-b:a', '128k',
+                # Copy all subtitles
+                '-c:s', 'copy',
+                # Remove metadata
+                '-map_metadata', '-1',
+                # Output file
+                fixed_output_path,
+            )
+        else:
+            await run_ffmpeg(
+                fixed_output_path,
+                # Print only errors
+                '-loglevel', 'error',
+                # Input file
+                '-i', fixed_input_path,
+                # Video encoding
+                '-c:v', 'libx264',
+                '-crf', str(byterate_decider.get_crf()),
+                '-profile:v', 'baseline',
+                '-level', '3.0',
+                '-pix_fmt', 'yuv420p',
+                # Audio encoding
+                '-c:a', 'aac',
+                '-ac', '2',
+                '-b:a', '128k',
+                # Enable MP4 streaming
+                '-movflags', 'faststart',
+                # Remove metadata
+                '-map_metadata', '-1',
+                # Output file
+                fixed_output_path,
+            )
 
     # If input file was copied, then remove it
     if fixed_input_path != input_path:
@@ -241,7 +291,7 @@ async def merge_videos(input_paths, output_path, max_size=None):
     fixed_output_path = fix_path_for_ffmpeg(output_path, True)
 
     # If input files have problematic names, then make a copies of them
-    for fixed_input_path, input_path in zip(fixed_output_path, fixed_input_path):
+    for fixed_input_path, input_path in zip(fixed_input_paths, input_paths):
         if fixed_input_path != input_path:
             shutil.copyfile(input_path, fixed_input_path)
 
@@ -256,27 +306,32 @@ async def merge_videos(input_paths, output_path, max_size=None):
                 for fixed_input_path in fixed_input_paths:
                     fixed_input_path_abs = os.path.abspath(fixed_input_path)
                     videolist_file.write(f'file \'{fixed_input_path_abs}\'\n')
-            await run_command(
-                'ffmpeg',
-                '-loglevel', 'quiet',
+            await run_ffmpeg(
+                fixed_output_path,
+                # Print only errors
+                '-loglevel', 'error',
+                # Concatenate videos listed in a file
                 '-f', 'concat', '-safe', '0', '-i', videolist_path,
+                # Video encoding
                 '-c:v', 'libx264',
                 '-crf', str(byterate_decider.get_crf()),
-                '-profile:v',
-                'baseline',
+                '-profile:v', 'baseline',
                 '-level', '3.0',
                 '-pix_fmt', 'yuv420p',
+                # Audio encoding
                 '-c:a', 'aac',
                 '-ac', '2',
                 '-b:a', '128k',
-                '-movflags',
-                'faststart',
+                # Enable MP4 streaming
+                '-movflags', 'faststart',
+                # Remove metadata
                 '-map_metadata', '-1',
+                # Output file
                 fixed_output_path,
             )
 
     # If input files were copied, then remove them
-    for fixed_input_path, input_path in zip(fixed_output_path, fixed_input_path):
+    for fixed_input_path, input_path in zip(fixed_input_paths, input_paths):
         if fixed_input_path != input_path:
             os.remove(fixed_input_path)
 
