@@ -306,8 +306,8 @@ async def convert_video(input_path, output_path, max_size=None, resize=None):
                 '-b:a', '128k',
                 # Copy all subtitles
                 '-c:s', 'copy',
-                # Remove metadata
-                '-map_metadata', '-1',
+                # Remove file-level metadata, but keep per-stream titles, languages and flags
+                '-map_metadata:g', '-1',
                 # Output file
                 fixed_output_path,
             )
@@ -332,8 +332,8 @@ async def convert_video(input_path, output_path, max_size=None, resize=None):
                 '-b:a', '128k',
                 # Enable MP4 streaming
                 '-movflags', 'faststart',
-                # Remove metadata
-                '-map_metadata', '-1',
+                # Remove file-level metadata, but keep per-stream titles, languages and flags
+                '-map_metadata:g', '-1',
                 # Output file
                 fixed_output_path,
             )
@@ -391,8 +391,8 @@ async def merge_videos(input_paths, output_path, max_size=None, resize=None):
                 '-b:a', '128k',
                 # Enable MP4 streaming
                 '-movflags', 'faststart',
-                # Remove metadata
-                '-map_metadata', '-1',
+                # Remove file-level metadata, but keep per-stream titles, languages and flags
+                '-map_metadata:g', '-1',
                 # Output file
                 fixed_output_path,
             )
