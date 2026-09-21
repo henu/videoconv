@@ -26,10 +26,18 @@ async def main():
     parser.add_argument('input_file', type=str, nargs='*', help='One or more input files')
     parser.add_argument('output_file', type=str, nargs=1, help='Output file, or input and output file, if they are the same file.')
     parser.add_argument('--max-size', type=int, help='Maximum limit for output file in mebibytes.')
+    parser.add_argument(
+        '--resize',
+        type=parse_resize,
+        metavar='WIDTHxHEIGHT',
+        help='Scale the video down to fit inside these dimensions. The aspect ratio is kept and videos are '
+             'never scaled up. Either dimension may be left out, for example "1280x" or "x720".',
+    )
     args = parser.parse_args()
     input_paths = args.input_file
     output_path = args.output_file[0]
     max_size = args.max_size * 1024 * 1024 if args.max_size else None
+    resize = args.resize
 
     # If input files do not exist, then raise an error
     for input_path in input_paths:
@@ -42,7 +50,7 @@ async def main():
 
     # If there is only one file, then just convert it
     if len(input_paths) == 1:
-        await convert_video(input_paths[0], output_path, max_size=max_size)
+        await convert_video(input_paths[0], output_path, max_size=max_size, resize=resize)
 
     # If there is no input files, then convert the existing file and use the same name as output
     elif not input_paths:
@@ -52,10 +60,10 @@ async def main():
             if not os.path.exists(output_path):
                 raise RuntimeError(f'Input file {output_path} does not exist!')
             temp_file_path = get_temp_filename(filename_prefix=output_path, ext=output_path_ext, temp_dir='')
-            await convert_video(output_path, temp_file_path, max_size=max_size)
+            await convert_video(output_path, temp_file_path, max_size=max_size, resize=resize)
             os.replace(temp_file_path, output_path)
         else:
-            await convert_video(output_path, f'{output_path_base}.mp4', max_size=max_size)
+            await convert_video(output_path, f'{output_path_base}.mp4', max_size=max_size, resize=resize)
             os.remove(output_path)
 
     # If there are multiple files
@@ -74,14 +82,63 @@ async def main():
                 conversion_tasks.append(convert_to_temporary_video(input_path))
             temporary_paths = await asyncio.gather(*conversion_tasks)
             # Merge
-            await merge_videos(temporary_paths, output_path, max_size=max_size)
+            await merge_videos(temporary_paths, output_path, max_size=max_size, resize=resize)
             # Clean
             for temporary_path in temporary_paths:
                 os.remove(temporary_path)
 
         # No problematic files were found, so just merge them
         else:
-            await merge_videos(input_paths, output_path, max_size=max_size)
+            await merge_videos(input_paths, output_path, max_size=max_size, resize=resize)
+
+
+def parse_resize(value):
+    width_str, separator, height_str = value.lower().partition('x')
+
+    # A lone number would not tell whether it means width or height, so the separator is always required
+    if not separator:
+        raise argparse.ArgumentTypeError(f'"{value}" is not a valid size. Use WIDTHxHEIGHT, WIDTHx or xHEIGHT.')
+
+    # Leaving out both dimensions would ask for no limit at all
+    if not width_str and not height_str:
+        raise argparse.ArgumentTypeError(f'"{value}" needs at least a width or a height.')
+
+    return parse_resize_dimension(width_str, 'Width'), parse_resize_dimension(height_str, 'Height')
+
+
+def parse_resize_dimension(value, name):
+    # A missing dimension means there is no limit for it
+    if not value:
+        return None
+
+    # Pixel counts are plain whole numbers
+    if not value.isascii() or not value.isdigit():
+        raise argparse.ArgumentTypeError(f'{name} "{value}" is not a whole number.')
+
+    # Anything smaller than this would not make a video
+    size = int(value)
+    if size < 2:
+        raise argparse.ArgumentTypeError(f'{name} must be at least 2 pixels.')
+
+    return size
+
+
+def get_scale_args(resize):
+    # Without --resize there is nothing to scale
+    if resize is None:
+        return ()
+
+    # A dimension that was left out is replaced by the source size, which never shrinks anything
+    width, height = resize
+    width_expr = 'iw' if width is None else str(width)
+    height_expr = 'ih' if height is None else str(height)
+
+    # Fit inside the limits, keep the aspect ratio, never scale up, and keep both sides even for yuv420p
+    scale_filter = (
+        f"scale=w='min({width_expr},iw)':h='min({height_expr},ih)'"
+        ':force_original_aspect_ratio=decrease:force_divisible_by=2'
+    )
+    return ('-vf', scale_filter)
 
 
 def is_problematic(path):
@@ -210,13 +267,15 @@ class ByterateDecider:
         return self.last_crf
 
 
-async def convert_video(input_path, output_path, max_size=None):
+async def convert_video(input_path, output_path, max_size=None, resize=None):
 
     # FFMpeg doesn't like certain filenames, so use another names if needed
     fixed_input_path = fix_path_for_ffmpeg(input_path, False)
     fixed_output_path = fix_path_for_ffmpeg(output_path, True)
 
     byterate_decider = ByterateDecider(max_size=max_size)
+
+    scale_args = get_scale_args(resize)
 
     # If input file has problematic name, then make a copy of it
     if fixed_input_path != input_path:
@@ -233,6 +292,8 @@ async def convert_video(input_path, output_path, max_size=None):
                 '-i', fixed_input_path,
                 # Include all streams
                 '-map', '0',
+                # Scale down, if asked to
+                *scale_args,
                 # Video encoding
                 '-c:v', 'libx264',
                 '-crf', str(byterate_decider.get_crf()),
@@ -257,6 +318,8 @@ async def convert_video(input_path, output_path, max_size=None):
                 '-loglevel', 'error',
                 # Input file
                 '-i', fixed_input_path,
+                # Scale down, if asked to
+                *scale_args,
                 # Video encoding
                 '-c:v', 'libx264',
                 '-crf', str(byterate_decider.get_crf()),
@@ -284,7 +347,7 @@ async def convert_video(input_path, output_path, max_size=None):
         shutil.move(fixed_output_path, output_path)
 
 
-async def merge_videos(input_paths, output_path, max_size=None):
+async def merge_videos(input_paths, output_path, max_size=None, resize=None):
 
     # FFMpeg doesn't like certain filenames, so use another names if needed
     fixed_input_paths = [fix_path_for_ffmpeg(input_path, False) for input_path in input_paths]
@@ -296,6 +359,8 @@ async def merge_videos(input_paths, output_path, max_size=None):
             shutil.copyfile(input_path, fixed_input_path)
 
     byterate_decider = ByterateDecider(max_size=max_size)
+
+    scale_args = get_scale_args(resize)
 
     while byterate_decider.check_output_file(fixed_output_path):
 
@@ -312,6 +377,8 @@ async def merge_videos(input_paths, output_path, max_size=None):
                 '-loglevel', 'error',
                 # Concatenate videos listed in a file
                 '-f', 'concat', '-safe', '0', '-i', videolist_path,
+                # Scale down, if asked to
+                *scale_args,
                 # Video encoding
                 '-c:v', 'libx264',
                 '-crf', str(byterate_decider.get_crf()),
